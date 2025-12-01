@@ -1,4 +1,24 @@
-import argparse
+"""
+main.py
+
+Fine-tune RETFound (OCT MAE) on the Kermany2018 OCT2017 dataset
+using a local GPU (if available).
+
+Usage:
+    python main.py
+
+Before running:
+1. Install dependencies:
+   pip install "transformers>=4.40.0" timm torchvision accelerate huggingface_hub
+
+2. Log in to HuggingFace from this machine (once):
+   huggingface-cli login
+
+3. Make sure you have access to the gated model:
+   - Visit https://huggingface.co/iszt/RETFound_mae_natureOCT
+   - Log in and click "Agree and access" / request access
+"""
+
 import os
 from pathlib import Path
 from typing import Tuple
@@ -19,6 +39,30 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 
+# ============================================================
+#                 CONFIGURATION – EDIT THIS
+# ============================================================
+
+class Config:
+    # Path to OCT2017 directory (containing train/ val/ test/)
+    DATA_ROOT = Path("/home/donna/Desktop/datasets/OCT2017")  # <-- EDIT THIS
+
+    # HuggingFace model id for RETFound (OCT MAE)
+    MODEL_ID = "iszt/RETFound_mae_natureOCT"
+
+    # Training hyperparameters
+    OUTPUT_DIR = Path("./retfound_oct_finetuned")
+    BATCH_SIZE = 16
+    EPOCHS = 5
+    LR = 5e-5
+    WEIGHT_DECAY = 0.05
+    NUM_WORKERS = 4
+
+
+# ============================================================
+#                    DATASET & DATALOADERS
+# ============================================================
+
 class RETFoundOCTDataset(Dataset):
     """
     Wraps an ImageFolder dataset and applies the RETFound image processor.
@@ -31,10 +75,10 @@ class RETFoundOCTDataset(Dataset):
     def __len__(self):
         return len(self.base)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        img, label = self.base[idx]  # img is a PIL Image if ImageFolder.transform is None
+    def __getitem__(self, idx) -> Tuple[torch.Tensor, int]:
+        img, label = self.base[idx]  # img is PIL.Image if transform is None
+
         if not isinstance(img, Image.Image):
-            # Just in case transform was set unexpectedly
             img = Image.fromarray(img)
 
         enc = self.processor(images=img, return_tensors="pt")
@@ -48,7 +92,9 @@ def collate_fn(batch):
     return pixel_values, labels
 
 
-def build_dataloaders(data_root: Path, processor, batch_size: int, num_workers: int = 4):
+def build_dataloaders(cfg: Config, processor):
+    data_root = cfg.DATA_ROOT
+
     train_base = ImageFolder(data_root / "train")
     val_base   = ImageFolder(data_root / "val")
     test_base  = ImageFolder(data_root / "test")
@@ -62,31 +108,35 @@ def build_dataloaders(data_root: Path, processor, batch_size: int, num_workers: 
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=batch_size,
+        batch_size=cfg.BATCH_SIZE,
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=cfg.NUM_WORKERS,
         pin_memory=True,
         collate_fn=collate_fn,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=batch_size,
+        batch_size=cfg.BATCH_SIZE,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=cfg.NUM_WORKERS,
         pin_memory=True,
         collate_fn=collate_fn,
     )
     test_loader = DataLoader(
         test_ds,
-        batch_size=batch_size,
+        batch_size=cfg.BATCH_SIZE,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=cfg.NUM_WORKERS,
         pin_memory=True,
         collate_fn=collate_fn,
     )
 
     return train_loader, val_loader, test_loader, classes
 
+
+# ============================================================
+#                    TRAIN / EVAL HELPERS
+# ============================================================
 
 def evaluate(model, loader, device) -> Tuple[float, float]:
     """
@@ -119,52 +169,38 @@ def evaluate(model, loader, device) -> Tuple[float, float]:
     return avg_loss, acc
 
 
-def train(
-    data_root: str,
-    model_id: str,
-    output_dir: str,
-    batch_size: int = 16,
-    epochs: int = 5,
-    lr: float = 5e-5,
-    weight_decay: float = 0.05,
-    num_workers: int = 4,
-):
+def train(cfg: Config):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    data_root = Path(data_root)
-    assert (data_root / "train").exists(), f"{data_root}/train not found"
-    assert (data_root / "val").exists(),   f"{data_root}/val not found"
-    assert (data_root / "test").exists(),  f"{data_root}/test not found"
+    # Sanity checks on data root
+    assert (cfg.DATA_ROOT / "train").exists(), f"{cfg.DATA_ROOT}/train not found"
+    assert (cfg.DATA_ROOT / "val").exists(),   f"{cfg.DATA_ROOT}/val not found"
+    assert (cfg.DATA_ROOT / "test").exists(),  f"{cfg.DATA_ROOT}/test not found"
 
-    # 1) Load processor
-    print(f"Loading image processor from '{model_id}'...")
-    processor = AutoImageProcessor.from_pretrained(model_id)
+    # 1) Load image processor
+    print(f"Loading image processor from '{cfg.MODEL_ID}'...")
+    processor = AutoImageProcessor.from_pretrained(cfg.MODEL_ID)
 
     # 2) Build dataloaders
-    train_loader, val_loader, test_loader, classes = build_dataloaders(
-        data_root=data_root,
-        processor=processor,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
+    train_loader, val_loader, test_loader, classes = build_dataloaders(cfg, processor)
 
     num_classes = len(classes)
     id2label = {i: c for i, c in enumerate(classes)}
     label2id = {c: i for i, c in id2label.items()}
 
-    # 3) Load RETFound model as a classifier
-    print(f"Loading RETFound model from '{model_id}'...")
-    config = AutoConfig.from_pretrained(model_id)
+    # 3) Load RETFound model as classifier
+    print(f"Loading RETFound model from '{cfg.MODEL_ID}'...")
+    config = AutoConfig.from_pretrained(cfg.MODEL_ID)
     config.num_labels = num_classes
     config.id2label = id2label
     config.label2id = label2id
 
     model = AutoModelForImageClassification.from_pretrained(
-        model_id,
+        cfg.MODEL_ID,
         config=config,
-        ignore_mismatched_sizes=True,  # replace classification head
+        ignore_mismatched_sizes=True,  # replace classifier head
     )
     model.to(device)
 
@@ -172,15 +208,15 @@ def train(
     print(model.config)
 
     # 4) Optimizer & scheduler
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+    optimizer = AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.EPOCHS)
 
     # 5) Training loop
-    os.makedirs(output_dir, exist_ok=True)
+    cfg.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     best_val_acc = 0.0
 
-    for epoch in range(1, epochs + 1):
-        print(f"\nEpoch {epoch}/{epochs}")
+    for epoch in range(1, cfg.EPOCHS + 1):
+        print(f"\nEpoch {epoch}/{cfg.EPOCHS}")
         model.train()
 
         total_loss = 0.0
@@ -220,13 +256,13 @@ def train(
         # Save best checkpoint
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            ckpt_path = Path(output_dir) / "best_model.pth"
+            ckpt_path = cfg.OUTPUT_DIR / "best_model.pth"
             torch.save(model.state_dict(), ckpt_path)
             print(f"  New best model saved to {ckpt_path} (val_acc={val_acc:.4f})")
 
-    # 6) Final test evaluation (using best model)
+    # 6) Final test evaluation
     print("\nLoading best model for final test evaluation...")
-    best_ckpt = Path(output_dir) / "best_model.pth"
+    best_ckpt = cfg.OUTPUT_DIR / "best_model.pth"
     if best_ckpt.exists():
         model.load_state_dict(torch.load(best_ckpt, map_location=device))
     else:
@@ -236,58 +272,20 @@ def train(
     print(f"\nTest loss: {test_loss:.4f} | Test accuracy: {test_acc:.4f}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Fine-tune RETFound (MAE OCT) on Kermany2018 OCT dataset."
-    )
-    parser.add_argument(
-        "--data-root",
-        type=str,
-        required=True,
-        help="Path to OCT2017 directory (containing train/ val/ test/).",
-    )
-    parser.add_argument(
-        "--model-id",
-        type=str,
-        default="iszt/RETFound_mae_natureOCT",
-        help="HuggingFace model id for RETFound (OCT MAE).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="./retfound_oct_finetuned",
-        help="Directory to save best_model.pth and logs.",
-    )
-    parser.add_argument(
-        "--batch-size", type=int, default=16, help="Batch size for training."
-    )
-    parser.add_argument(
-        "--epochs", type=int, default=5, help="Number of training epochs."
-    )
-    parser.add_argument(
-        "--lr", type=float, default=5e-5, help="Learning rate."
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=0.05, help="Weight decay."
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of DataLoader workers.",
-    )
-    return parser.parse_args()
-
+# ============================================================
+#                           MAIN
+# ============================================================
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(
-        data_root=args.data_root,
-        model_id=args.model_id,
-        output_dir=args.output_dir,
-        batch_size=args.batch_size,
-        epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        num_workers=args.num_workers,
-    )
+    cfg = Config()
+    print("Config:")
+    print(f"  DATA_ROOT   = {cfg.DATA_ROOT}")
+    print(f"  MODEL_ID    = {cfg.MODEL_ID}")
+    print(f"  OUTPUT_DIR  = {cfg.OUTPUT_DIR}")
+    print(f"  BATCH_SIZE  = {cfg.BATCH_SIZE}")
+    print(f"  EPOCHS      = {cfg.EPOCHS}")
+    print(f"  LR          = {cfg.LR}")
+    print(f"  WEIGHT_DECAY= {cfg.WEIGHT_DECAY}")
+    print(f"  NUM_WORKERS = {cfg.NUM_WORKERS}")
+
+    train(cfg)
